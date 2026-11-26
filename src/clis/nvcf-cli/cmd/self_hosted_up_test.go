@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,13 +39,10 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apiextclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	k8sruntime "k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
-	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/rest"
 
 	"nvcf-cli/internal/selfhosted"
 	"nvcf-cli/internal/selfhosted/auth"
@@ -1815,67 +1813,77 @@ func TestEnsureDockerConfigSecret(t *testing.T) {
 	}
 }
 
+func newSecretErrorTestClient(t *testing.T, handler http.HandlerFunc) kubernetes.Interface {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	kube, err := kubernetes.NewForConfig(&rest.Config{Host: server.URL})
+	require.NoError(t, err)
+	return kube
+}
+
+func writeCoreAPIStatus(t *testing.T, w http.ResponseWriter, status int) {
+	t.Helper()
+	reason := metav1.StatusReasonInternalError
+	if status == http.StatusNotFound {
+		reason = metav1.StatusReasonNotFound
+	}
+	if status == http.StatusConflict {
+		reason = metav1.StatusReasonAlreadyExists
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	assert.NoError(t, json.NewEncoder(w).Encode(metav1.Status{
+		TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"},
+		Status:   metav1.StatusFailure, Reason: reason, Code: int32(status),
+		Message: http.StatusText(status),
+	}))
+}
+
 func TestEnsureDockerConfigSecretErrorPaths(t *testing.T) {
 	const namespace = "nvcf-secret-errors"
 	const name = "registry-pull-secret"
 	payload := []byte(`{"auths":{}}`)
-	getFailure := errors.New("get unavailable")
-	updateFailure := errors.New("update unavailable")
-	createFailure := errors.New("create unavailable")
-
 	tests := []struct {
-		name          string
-		getErr        error
-		updateErr     error
-		createErr     error
-		wantError     string
-		wantCreate    bool
+		name                                  string
+		getStatus, updateStatus, createStatus int
+		wantError                             string
+		wantCreate                            bool
 	}{
-		{
-			name:      "get failure",
-			getErr:    getFailure,
-			wantError: "get pull secret " + namespace + "/" + name,
-		},
-		{
-			name:       "update failure",
-			updateErr:  updateFailure,
-			wantError:  "update pull secret " + namespace + "/" + name,
-		},
-		{
-			name:       "create failure",
-			getErr:     apierrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, name),
-			createErr:  createFailure,
-			wantError:  "create pull secret " + namespace + "/" + name,
-			wantCreate: true,
-		},
-		{
-			name:       "create already exists race",
-			getErr:     apierrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, name),
-			createErr:  apierrors.NewAlreadyExists(schema.GroupResource{Resource: "secrets"}, name),
-			wantCreate: true,
-		},
+		{name: "get failure", getStatus: http.StatusInternalServerError, wantError: "get pull secret " + namespace + "/" + name},
+		{name: "update failure", getStatus: http.StatusOK, updateStatus: http.StatusInternalServerError, wantError: "update pull secret " + namespace + "/" + name},
+		{name: "create failure", getStatus: http.StatusNotFound, createStatus: http.StatusInternalServerError, wantError: "create pull secret " + namespace + "/" + name, wantCreate: true},
+		{name: "create already exists race", getStatus: http.StatusNotFound, createStatus: http.StatusConflict, wantCreate: true},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			seed := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}}
-			kube := fake.NewSimpleClientset(seed)
-			if tt.getErr != nil {
-				kube.PrependReactor("get", "secrets", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
-					return true, nil, tt.getErr
-				})
-			}
-			if tt.updateErr != nil {
-				kube.PrependReactor("update", "secrets", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
-					return true, nil, tt.updateErr
-				})
-			}
-			if tt.createErr != nil {
-				kube.PrependReactor("create", "secrets", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
-					return true, nil, tt.createErr
-				})
-			}
-
+			var created atomic.Bool
+			kube := newSecretErrorTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				status := 0
+				switch r.Method {
+				case http.MethodGet:
+					assert.Equal(t, "/api/v1/namespaces/"+namespace+"/secrets/"+name, r.URL.Path)
+					status = tt.getStatus
+				case http.MethodPut:
+					status = tt.updateStatus
+				case http.MethodPost:
+					assert.Equal(t, "/api/v1/namespaces/"+namespace+"/secrets", r.URL.Path)
+					created.Store(true)
+					status = tt.createStatus
+				default:
+					t.Errorf("unexpected method %s", r.Method)
+					status = http.StatusMethodNotAllowed
+				}
+				if status != http.StatusOK {
+					writeCoreAPIStatus(t, w, status)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				assert.NoError(t, json.NewEncoder(w).Encode(&corev1.Secret{
+					TypeMeta:   metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+				}))
+			})
 			err := ensureDockerConfigSecret(context.Background(), kube, namespace, name, payload)
 			if tt.wantError != "" {
 				require.Error(t, err)
@@ -1884,14 +1892,7 @@ func TestEnsureDockerConfigSecretErrorPaths(t *testing.T) {
 			}
 			require.NoError(t, err)
 			if tt.wantCreate {
-				created := false
-				for _, action := range kube.Actions() {
-					if action.GetVerb() == "create" {
-						created = true
-						break
-					}
-				}
-				assert.True(t, created, "Create should be attempted")
+				assert.True(t, created.Load(), "Create should be attempted")
 			}
 		})
 	}
@@ -1899,35 +1900,38 @@ func TestEnsureDockerConfigSecretErrorPaths(t *testing.T) {
 
 func TestEnsureNamespace(t *testing.T) {
 	const namespace = "nvcf-ensure-test"
-
 	tests := []struct {
 		name      string
-		seed      *corev1.Namespace
-		getErr    error
+		exists    bool
+		getError  bool
 		wantError string
 	}{
-		{
-			name: "reuse existing active namespace",
-			seed: &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}},
-		},
+		{name: "reuse existing active namespace", exists: true},
 		{name: "create missing namespace"},
-		{name: "return get error", getErr: errors.New("API unavailable"), wantError: "get namespace " + namespace},
+		{name: "return get error", getError: true, wantError: "get namespace " + namespace},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var kube *fake.Clientset
-			if tt.seed == nil {
-				kube = fake.NewSimpleClientset()
-			} else {
-				kube = fake.NewSimpleClientset(tt.seed.DeepCopy())
-			}
-			if tt.getErr != nil {
-				kube.PrependReactor("get", "namespaces", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
-					return true, nil, tt.getErr
-				})
-			}
-
+			var created atomic.Bool
+			kube := newSecretErrorTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && tt.getError {
+					writeCoreAPIStatus(t, w, http.StatusInternalServerError)
+					return
+				}
+				if r.Method == http.MethodGet && !tt.exists && !created.Load() {
+					writeCoreAPIStatus(t, w, http.StatusNotFound)
+					return
+				}
+				if r.Method == http.MethodPost {
+					created.Store(true)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				assert.NoError(t, json.NewEncoder(w).Encode(&corev1.Namespace{
+					TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+					ObjectMeta: metav1.ObjectMeta{Name: namespace},
+					Status:     corev1.NamespaceStatus{Phase: corev1.NamespaceActive},
+				}))
+			})
 			err := ensureNamespace(context.Background(), kube, namespace)
 			if tt.wantError != "" {
 				require.Error(t, err)
