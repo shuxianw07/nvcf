@@ -33,13 +33,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apiextclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"nvcf-cli/internal/selfhosted"
 	"nvcf-cli/internal/selfhosted/auth"
@@ -1082,6 +1087,66 @@ func (r *recordingSink) details() []string {
 	return out
 }
 
+type startableRecordingSink struct {
+	*recordingSink
+	starts int
+}
+
+func (s *startableRecordingSink) Start() { s.starts++ }
+
+func TestConfigureUpOutput(t *testing.T) {
+	tests := []struct {
+		name string
+		kind progress.RendererKind
+		tty  bool
+	}{
+		{name: "plain renderer passthrough", kind: progress.RendererPlain},
+		{name: "full TTY renderer", kind: progress.RendererTTYFull, tty: true},
+		{name: "compact TTY renderer", kind: progress.RendererTTYCompact, tty: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			c := &cobra.Command{}
+			c.SetOut(&stdout)
+			c.SetErr(&stderr)
+			sink := &recordingSink{}
+
+			out, errOut, cleanup := configureUpOutput(c, sink, tt.kind)
+			require.NotNil(t, cleanup)
+			if !tt.tty {
+				assert.Same(t, &stdout, out)
+				assert.Same(t, &stderr, errOut)
+				cleanup()
+				cleanup()
+				assert.Empty(t, sink.events)
+				return
+			}
+
+			_, writeErr := io.WriteString(out, "partial stdout")
+			require.NoError(t, writeErr)
+			_, writeErr = io.WriteString(errOut, "partial stderr")
+			require.NoError(t, writeErr)
+			cleanup()
+			cleanup()
+
+			require.Len(t, sink.events, 2)
+			assert.Equal(t, progress.LogLine{Stream: "stdout", Source: "helmfile", Line: "partial stdout"}, sink.events[0])
+			assert.Equal(t, progress.LogLine{Stream: "stderr", Source: "helmfile", Line: "partial stderr"}, sink.events[1])
+		})
+	}
+
+	t.Run("start only sinks that implement Start", func(t *testing.T) {
+		startable := &startableRecordingSink{recordingSink: &recordingSink{}}
+		startEventSink(startable)
+		assert.Equal(t, 1, startable.starts)
+
+		ordinary := &recordingSink{}
+		assert.NotPanics(t, func() { startEventSink(ordinary) })
+	})
+}
+
 // TestProbeControlPlaneFingerprint_Success exercises the happy path: a
 // reachable control-plane URL whose OIDC/JWKS discovery returns a usable
 // fingerprint.
@@ -1746,6 +1811,133 @@ func TestEnsureDockerConfigSecret(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, corev1.SecretTypeDockerConfigJson, secret.Type)
 			assert.Equal(t, payload, secret.Data[corev1.DockerConfigJsonKey])
+		})
+	}
+}
+
+func TestEnsureDockerConfigSecretErrorPaths(t *testing.T) {
+	const namespace = "nvcf-secret-errors"
+	const name = "registry-pull-secret"
+	payload := []byte(`{"auths":{}}`)
+	getFailure := errors.New("get unavailable")
+	updateFailure := errors.New("update unavailable")
+	createFailure := errors.New("create unavailable")
+
+	tests := []struct {
+		name          string
+		getErr        error
+		updateErr     error
+		createErr     error
+		wantError     string
+		wantCreate    bool
+	}{
+		{
+			name:      "get failure",
+			getErr:    getFailure,
+			wantError: "get pull secret " + namespace + "/" + name,
+		},
+		{
+			name:       "update failure",
+			updateErr:  updateFailure,
+			wantError:  "update pull secret " + namespace + "/" + name,
+		},
+		{
+			name:       "create failure",
+			getErr:     apierrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, name),
+			createErr:  createFailure,
+			wantError:  "create pull secret " + namespace + "/" + name,
+			wantCreate: true,
+		},
+		{
+			name:       "create already exists race",
+			getErr:     apierrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, name),
+			createErr:  apierrors.NewAlreadyExists(schema.GroupResource{Resource: "secrets"}, name),
+			wantCreate: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			seed := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}}
+			kube := fake.NewSimpleClientset(seed)
+			if tt.getErr != nil {
+				kube.PrependReactor("get", "secrets", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+					return true, nil, tt.getErr
+				})
+			}
+			if tt.updateErr != nil {
+				kube.PrependReactor("update", "secrets", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+					return true, nil, tt.updateErr
+				})
+			}
+			if tt.createErr != nil {
+				kube.PrependReactor("create", "secrets", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+					return true, nil, tt.createErr
+				})
+			}
+
+			err := ensureDockerConfigSecret(context.Background(), kube, namespace, name, payload)
+			if tt.wantError != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantError)
+				return
+			}
+			require.NoError(t, err)
+			if tt.wantCreate {
+				created := false
+				for _, action := range kube.Actions() {
+					if action.GetVerb() == "create" {
+						created = true
+						break
+					}
+				}
+				assert.True(t, created, "Create should be attempted")
+			}
+		})
+	}
+}
+
+func TestEnsureNamespace(t *testing.T) {
+	const namespace = "nvcf-ensure-test"
+
+	tests := []struct {
+		name      string
+		seed      *corev1.Namespace
+		getErr    error
+		wantError string
+	}{
+		{
+			name: "reuse existing active namespace",
+			seed: &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}},
+		},
+		{name: "create missing namespace"},
+		{name: "return get error", getErr: errors.New("API unavailable"), wantError: "get namespace " + namespace},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var kube *fake.Clientset
+			if tt.seed == nil {
+				kube = fake.NewSimpleClientset()
+			} else {
+				kube = fake.NewSimpleClientset(tt.seed.DeepCopy())
+			}
+			if tt.getErr != nil {
+				kube.PrependReactor("get", "namespaces", func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+					return true, nil, tt.getErr
+				})
+			}
+
+			err := ensureNamespace(context.Background(), kube, namespace)
+			if tt.wantError != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantError)
+				return
+			}
+			require.NoError(t, err)
+			ns, err := kube.CoreV1().Namespaces().Get(context.Background(), namespace, metav1.GetOptions{})
+			require.NoError(t, err)
+			assert.Equal(t, namespace, ns.Name)
 		})
 	}
 }
